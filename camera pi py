@@ -1,0 +1,320 @@
+import cv2
+import numpy as np
+import math
+import csv
+import os
+import time
+import threading
+from flask import Flask, Response, render_template_string, request
+
+# ============================================================================
+# 1. CONFIGURAÇÕES
+# ============================================================================
+ARQUIVO_CSV = "Cores e Figuras.xlsx - Página1.csv"
+
+# --- CALIBRAÇÃO PARA CÂMERA "LAVADA/IR" ---
+# A água em câmeras IR costuma ser cinza médio/claro com saturação quase zero.
+# H: Qualquer (0-180) | S: Baixa (0-60) | V: Média/Alta (50-255)
+# O que NÃO for isso, será considerado Objeto.
+CALIB_AGUA_MIN = np.array([0, 0, 40])
+CALIB_AGUA_MAX = np.array([180, 70, 230])
+
+# --- CLASSIFICAÇÃO (Ajustado para contraste) ---
+# Óleo em IR absorve luz -> Fica PRETO/MUITO ESCURO
+MIN_OLEO = np.array([0, 0, 0])
+MAX_OLEO = np.array([180, 255, 60]) # V < 60 é o segredo aqui
+
+# Alga em IR costuma refletir -> Fica BRANCA ou CINZA CLARO
+# Ou se for alga escura, cairá na detecção por tamanho/forma
+MIN_ALGA = np.array([0, 0, 0])      
+MAX_ALGA = np.array([180, 255, 140]) 
+
+AREA_MINIMA_GERAL = 10        
+AREA_MAXIMA_ALGA = 200       
+AREA_MINIMA_OLEO = 201  
+
+# Variáveis Globais
+frame_raw = None      
+frame_analisado = None
+lock = threading.Lock()
+
+app = Flask(__name__)
+
+# ============================================================================
+# 2. PRÉ-PROCESSAMENTO (O Segredo para Câmeras Ruins)
+# ============================================================================
+def realcar_imagem_ir(img):
+    """
+    Pega uma imagem 'lavada/cinza' e força o contraste e a cor.
+    Essencial para câmeras NoIR ou com infravermelho ativado.
+    """
+    # 1. Aplica CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # Isso melhora a definição local (separa navio da água cinza)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl,a,b))
+    img_contraste = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+    # 2. Boost Artificial de Saturação (Faz o pouco de cor que existe "gritar")
+    hsv = cv2.cvtColor(img_contraste, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    # Multiplica a saturação por 2.0 (até o limite de 255)
+    s = cv2.multiply(s, 2.0) 
+    # Aumenta um pouco o brilho também
+    v = cv2.add(v, 20)
+    
+    img_boosted = cv2.merge((h, s, v))
+    img_final = cv2.cvtColor(img_boosted, cv2.COLOR_HSV2BGR)
+    
+    return img_final
+
+# ============================================================================
+# 3. BANCO DE DADOS
+# ============================================================================
+def carregar_db():
+    db = []
+    if os.path.exists(ARQUIVO_CSV):
+        try:
+            with open(ARQUIVO_CSV, 'r', encoding='utf-8') as f:
+                leitor = csv.reader(f)
+                next(leitor)
+                for l in leitor:
+                    if len(l) >= 6:
+                        try:
+                            db.append({'mmsi': l[1], 'rgb': (int(l[3]), int(l[4]), int(l[5]))})
+                        except: continue
+        except: pass
+    return db
+
+DB_NAVIOS = carregar_db()
+
+# ============================================================================
+# 4. VISÃO COMPUTACIONAL
+# ============================================================================
+def processar_imagem_completa(img_original):
+    # Reduz resolução para processar rápido no Pi Zero
+    img_input = cv2.resize(img_original, (640, 480))
+    
+    # --- PASSO CRÍTICO: MELHORAR A IMAGEM ---
+    img = realcar_imagem_ir(img_input)
+    
+    h_arena, w_arena = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Máscara de Água (Fundo)
+    mask_agua = cv2.inRange(hsv, CALIB_AGUA_MIN, CALIB_AGUA_MAX)
+    mask_obj = cv2.bitwise_not(mask_agua) # O que NÃO é água cinza, é objeto
+    
+    # Limpeza
+    kernel = np.ones((3,3), np.uint8)
+    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_OPEN, kernel)
+    mask_obj = cv2.dilate(mask_obj, kernel, iterations=1)
+    
+    contornos, _ = cv2.findContours(mask_obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    objs_navio = []
+    objs_oleo = []
+    
+    for cnt in contornos:
+        area = cv2.contourArea(cnt)
+        if area < AREA_MINIMA_GERAL: continue
+        if area > (w_arena * h_arena) * 0.90: continue 
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        centro = (int(x + w/2), int(y + h/2))
+        
+        # Analisa a cor média DENTRO do objeto (na imagem realçada)
+        mask_i = np.zeros((h_arena, w_arena), dtype=np.uint8)
+        cv2.drawContours(mask_i, [cnt], -1, 255, -1)
+        media_hsv = cv2.mean(hsv, mask=mask_i)[:3]
+        media_bgr = cv2.mean(img, mask=mask_i)[:3] # Usa BGR realçado para identificar MMSI
+
+        # --- CLASSIFICAÇÃO ---
+        # Como a cor é ruim, confiamos muito no VALOR (Brilho) e TAMANHO
+        
+        # ÓLEO: É muito escuro (V baixo) e grande
+        is_dark = media_hsv[2] < 70 
+        is_oleo_size = area > AREA_MINIMA_OLEO
+        
+        # ALGA: É pequena
+        is_small = area <= AREA_MAXIMA_ALGA
+
+        label = "NAVIO" # Padrão
+        
+        if is_dark and is_oleo_size:
+            label = "OLEO"
+        elif is_small:
+            # Se for pequeno, pode ser alga (escura ou clara)
+            label = "ALGA"
+
+        # --- DESENHO NA TELA (Usamos a imagem INPUT original para mostrar, ou a realçada?)
+        # Vamos desenhar na realçada para você ver o que o robô está "vendo"
+        
+        if label == "OLEO":
+            objs_oleo.append({'pos': centro})
+            cv2.drawContours(img, [cnt], -1, (0,0,255), 2)
+            cv2.putText(img, "OLEO", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+            
+        elif label == "ALGA":
+            cv2.circle(img, centro, 4, (180, 180, 180), -1)
+            
+        elif label == "NAVIO":
+            # Identificação MMSI (Comparação de Cor Euclidiana)
+            # Nota: Com imagem IR, a cor vermelha vira cinza escuro.
+            # O ideal seria calibrar o CSV para cores IR, mas vamos tentar aproximar.
+            b, g, r = media_bgr
+            menor_d = float('inf')
+            mmsi = "Desconhecido"
+            
+            for nav in DB_NAVIOS:
+                r_db, g_db, b_db = nav['rgb']
+                d = math.sqrt((r - r_db)**2 + (g - g_db)**2 + (b - b_db)**2)
+                if d < menor_d:
+                    menor_d = d
+                    mmsi = nav['mmsi']
+            
+            # Aumentamos a tolerância de erro de cor (60 -> 100) devido à distorção IR
+            if menor_d > 100: mmsi = "Nao Listado"
+            
+            objs_navio.append({'pos': centro, 'mmsi': mmsi})
+            cv2.rectangle(img, (x,y), (x+w, y+h), (0, 255, 0), 2)
+            if w > 15:
+                cv2.putText(img, str(mmsi), (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+
+    # Detecção de Poluição
+    poluidor = None
+    for oleo in objs_oleo:
+        menor_d = float('inf')
+        culpado = None
+        for navio in objs_navio:
+            d = math.dist(oleo['pos'], navio['pos'])
+            if d < menor_d:
+                menor_d = d
+                culpado = navio
+        if culpado and menor_d < 200:
+            cv2.line(img, oleo['pos'], culpado['pos'], (0, 255, 255), 2)
+            poluidor = culpado
+
+    # Desenha HUD
+    return desenhar_hud(img, len(objs_navio), len(objs_oleo), poluidor, objs_navio)
+
+def desenhar_hud(img, n_navios, n_oleo, poluidor, lista_navios):
+    h, w = img.shape[:2]
+    # Expande imagem para caber HUD
+    img_hud = cv2.copyMakeBorder(img, 0, 0, 0, 220, cv2.BORDER_CONSTANT, value=(20,20,20))
+    
+    x = w + 10
+    y = 30
+    f = cv2.FONT_HERSHEY_SIMPLEX
+    
+    cv2.putText(img_hud, "SENSOR: IR/NOIR", (x, y), f, 0.5, (0, 255, 255), 1)
+    y += 40
+    cv2.putText(img_hud, f"Navios: {n_navios}", (x, y), f, 0.5, (0, 255, 0), 1)
+    y += 20
+    cv2.putText(img_hud, f"Oleo: {n_oleo}", (x, y), f, 0.5, (0, 0, 255), 1)
+    
+    if poluidor:
+        y += 40
+        cv2.putText(img_hud, "ALERTA POLUIDOR", (x, y), f, 0.5, (0,0,255), 2)
+        cv2.putText(img_hud, f"MMSI: {poluidor['mmsi']}", (x, y+20), f, 0.4, (255,255,0), 1)
+        
+    return img_hud
+
+# ============================================================================
+# 5. CÂMERA ROBUSTA (Inclui correções de leitura Null)
+# ============================================================================
+def camera_loop():
+    global frame_raw, lock
+    print("Iniciando câmera (Modo Compatibilidade)...")
+    
+    cap = None
+    
+    # Tenta conectar de várias formas para evitar o erro "Null"
+    for index in [0, 1, -1]:
+        try:
+            # Tenta backend V4L2 (padrão Linux)
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if cap.isOpened():
+                # Força MJPEG para evitar erro de timeout
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                print(f"Câmera conectada no índice {index}")
+                break
+        except: pass
+        
+    if cap is None or not cap.isOpened():
+        print("ERRO CRÍTICO: Câmera não encontrada. Verifique cabo flat.")
+        # Gera ruído falso para não travar o site
+        while True:
+            noise = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+            cv2.putText(noise, "SEM CAMERA", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            with lock: frame_raw = noise
+            time.sleep(0.1)
+
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            with lock:
+                frame_raw = frame
+        else:
+            print("Falha de quadro. Tentando recuperar...")
+            cap.release()
+            time.sleep(1)
+            cap.open(0, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            
+        time.sleep(0.04)
+
+# ============================================================================
+# 6. SERVIDOR WEB
+# ============================================================================
+@app.route("/")
+def index():
+    return render_template_string("""
+    <html>
+    <body style="background:#000;color:#0f0;text-align:center;font-family:monospace">
+        <h1>CUBESAT IR MONITOR</h1>
+        <img src="/video_stream" style="border:2px solid #0f0;width:100%;max-width:640px">
+        <form action="/analisar" method="post">
+            <button style="background:#060;color:#fff;padding:15px;width:100%;max-width:640px;font-size:18px;margin-top:10px;border:none;cursor:pointer">
+                ANALISAR IMAGEM AGORA
+            </button>
+        </form>
+    </body>
+    </html>
+    """)
+
+@app.route("/video_stream")
+def video_stream():
+    def gerar():
+        while True:
+            with lock:
+                if frame_raw is None: 
+                    time.sleep(0.1); continue
+                flag, encoded = cv2.imencode(".jpg", frame_raw)
+            if flag:
+                yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded) + b'\r\n')
+            time.sleep(0.05)
+    return Response(gerar(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/analisar", methods=['POST'])
+def analisar():
+    global frame_raw
+    with lock:
+        if frame_raw is None: return "Sem Imagem"
+        img = frame_raw.copy()
+    
+    res = processar_imagem_completa(img)
+    flag, encoded = cv2.imencode(".jpg", res)
+    return Response(encoded.tobytes(), mimetype="image/jpeg", headers={"Content-Length": len(encoded.tobytes())})
+
+if __name__ == '__main__':
+    t = threading.Thread(target=camera_loop)
+    t.daemon = True
+    t.start()
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
