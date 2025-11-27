@@ -1,7 +1,5 @@
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog
 import math
 import csv
 import os
@@ -9,32 +7,35 @@ import random
 import platform
 import sys
 import time
+import base64
+from io import BytesIO
+from flask import Flask, render_template_string, send_file, url_for
 
 # ============================================================================
 # CONFIGURAÇÕES E BANCO DE DADOS
 # ============================================================================
 
 ARQUIVO_CSV = "Cores e Figuras.xlsx - Página1.csv"
-
-# --- PARÂMETROS DE GEOLOCALIZAÇÃO ---
 LARGURA_SIMULACAO = 200
 ALTURA_SIMULACAO = 200
-
-# --- CONFIGURAÇÃO DE CORES (HSV) ---
 MIN_OLEO = np.array([0, 0, 0])
 MAX_OLEO = np.array([180, 255, 60])
 MIN_ALGA = np.array([0, 0, 20])
 MAX_ALGA = np.array([180, 100, 150])
-
-# --- PARÂMETROS DE ÁREA ---
 AREA_MINIMA_GERAL = 10
 AREA_MAXIMA_ALGA = 150
 AREA_MINIMA_OLEO = 151
-
-# --- PARÂMETROS DE DETECÇÃO DE POLUIDOR ---
 RAIO_POLUIDOR_MAX = 150
 
-def nada(x): pass
+# Variáveis globais para a câmera
+cap = None
+calib = {} # Calibração padrão
+
+# Calibração Padrão Fixada (HSV da Arena)
+CALIB_PADRAO = {
+    'h_min': 39, 's_min': 0, 'v_min': 0, 
+    'h_max': 97, 's_max': 132, 'v_max': 146
+}
 
 # ============================================================================
 # 1. MÓDULO DE IDENTIFICAÇÃO (MMSI via CSV)
@@ -45,7 +46,8 @@ def carregar_banco_dados_navios(caminho_csv):
     if not os.path.exists(caminho_csv):
         print(f"AVISO: Arquivo '{caminho_csv}' não encontrado. A identificação MMSI não funcionará.")
         return []
-
+    
+    # ... (Resto da função de carregar_banco_dados_navios, que é a mesma)
     try:
         with open(caminho_csv, 'r', encoding='utf-8-sig') as f:
             leitor = csv.reader(f)
@@ -91,7 +93,7 @@ def identificar_mmsi(cor_bgr_media, db_navios):
     return mmsi_encontrado, menor_distancia
 
 # ============================================================================
-# 2. UTILITÁRIOS E PROCESSAMENTO
+# 2. FUNÇÕES DE PROCESSAMENTO
 # ============================================================================
 
 def converter_coord(x, y, w_img, h_img):
@@ -112,217 +114,228 @@ def classificar_objeto(media_hsv, area):
     else:
         return "NAVIO", (0, 0, 255)
 
-def recortar_arena(frame, calib):
-    # MODO MANUAL: Retorna o frame inteiro
-    return frame, True
+def desenhar_rotulos(img, dados):
+    h_arena, w_arena = img.shape[:2]
+    
+    # Reutiliza a lógica de detecção para desenhar no frame
+    
+    # 1. Contornos e Máscaras (Usando a calibração padrão fixa)
+    hsv_arena = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower_w = np.array([CALIB_PADRAO['h_min'], CALIB_PADRAO['s_min'], CALIB_PADRAO['v_min']])
+    upper_w = np.array([CALIB_PADRAO['h_max'], CALIB_PADRAO['s_max'], CALIB_PADRAO['v_max']])
+    mask_obj = cv2.bitwise_not(cv2.inRange(hsv_arena, lower_w, upper_w))
 
-def desenhar_hud(img, dados):
-    h, w = img.shape[:2]
-    w_hud = 280
-    tela = np.zeros((h, w + w_hud, 3), dtype=np.uint8)
-    tela[0:h, 0:w] = img
+    kernel_obj = np.ones((3,3), np.uint8)
+    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_OPEN, kernel_obj, iterations=1)
+    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_CLOSE, kernel_obj, iterations=2)
 
-    cv2.rectangle(tela, (w, 0), (w+w_hud, h), (30, 30, 30), -1)
-    x, y, f = w + 20, 40, cv2.FONT_HERSHEY_SIMPLEX
+    contornos, _ = cv2.findContours(mask_obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    cv2.putText(tela, "PROJETO CUBESAT", (x, y), f, 0.6, (0, 255, 255), 2)
-    y += 40
-
-    cv2.putText(tela, f"Navios: {len(dados['lista_navios'])}", (x, y), f, 0.5, (0, 255, 0), 1)
-    y += 25
-    for navio in dados['lista_navios'][:5]:
-        mmsi = navio['mmsi']
-        cv2.putText(tela, f"> {mmsi}", (x, y), f, 0.4, (200, 255, 200), 1)
-        y += 20
-
-    y += 10
-    cv2.putText(tela, f"Oleo: {dados['oleo']}", (x, y), f, 0.5, (0, 0, 255), 1)
-
-    y += 40
-    if dados['poluidor']:
-        p = dados['poluidor']
-        cv2.rectangle(tela, (x-5, y-25), (w+w_hud-10, y+45), (0, 0, 150), -1)
-        cv2.putText(tela, "ALERTA: POLUIDOR", (x, y), f, 0.5, (255, 255, 255), 2)
-        cv2.putText(tela, f"MMSI: {p['mmsi']}", (x, y+20), f, 0.5, (255, 255, 0), 2)
-    else:
-        cv2.putText(tela, "Status: SEGURO", (x, y), f, 0.6, (0, 255, 0), 1)
-
-    return tela
-
-def main():
+    # 2. Recálculo e Desenho
     db_navios = carregar_banco_dados_navios(ARQUIVO_CSV)
     
-    # --- CONFIGURAÇÃO RIGOROSA DE CÂMERA ---
-    cap = None
-    fonte = 0
+    objs_navio = []
+    objs_oleo = []
     
-    sistema_os = platform.system()
-    print(f"--- Sistema Detectado: {sistema_os} ---")
+    # Recomputa a área real (km²)
+    area_total_km2 = (LARGURA_SIMULACAO * 2) * (ALTURA_SIMULACAO * 2)
+    area_total_px = w_arena * h_arena
+    km2_por_pixel = area_total_km2 / area_total_px if area_total_px > 0 else 0
 
+
+    for cnt in contornos:
+        area_px = cv2.contourArea(cnt)
+        if area_px < AREA_MINIMA_GERAL: continue
+        if area_px > (w_arena * h_arena) * 0.95: continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        centro = (int(x + w/2), int(y + h/2))
+        
+        mask_i = np.zeros((h_arena, w_arena), dtype=np.uint8)
+        cv2.drawContours(mask_i, [cnt], -1, 255, -1)
+
+        media_hsv = cv2.mean(hsv_arena, mask=mask_i)[:3]
+        media_bgr = cv2.mean(img, mask=mask_i)[:3]
+
+        label, cor = classificar_objeto(media_hsv, area_px)
+        
+        lat, lon = converter_coord(centro[0], centro[1], w_arena, h_arena)
+
+        if label == "OLEO":
+            objs_oleo.append({'pos': centro, 'lat': lat, 'lon': lon})
+            cv2.drawContours(img, [cnt], -1, (0,0,255), 2)
+            
+            # Desenha texto da área (mantendo a lógica de erro do código original)
+            area_real_km2 = area_px * km2_por_pixel
+            porcentagem_erro = random.uniform(0.01, 0.10)
+            sinal_erro = random.choice([-1, 1])
+            area_com_erro = area_real_km2 * (1 + (sinal_erro * porcentagem_erro))
+            texto_area = f"{area_com_erro:.2f} km2"
+            cv2.putText(img, texto_area, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(img, "OLEO", (x, y + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        elif label == "ALGA":
+            dados['algas'] += 1
+            cv2.circle(img, centro, 5, cor, -1)
+
+        elif label == "NAVIO":
+            mmsi, conf = identificar_mmsi(media_bgr, db_navios)
+            objs_navio.append({'pos': centro, 'lat': lat, 'lon': lon, 'mmsi': mmsi})
+            cv2.rectangle(img, (x,y), (x+w, y+h), cor, 2)
+            if w > 10:
+                cv2.putText(img, str(mmsi), (x, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+                cv2.putText(img, "NAVIO", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, cor, 1)
+
+    # 3. Lógica do Poluidor
+    poluidor = None
+    for oleo in objs_oleo:
+        menor_d = float('inf')
+        culpado = None
+        for navio in objs_navio:
+            d = math.dist(oleo['pos'], navio['pos'])
+            if d < menor_d:
+                menor_d = d
+                culpado = navio
+        if culpado and menor_d < RAIO_POLUIDOR_MAX:
+            cv2.line(img, oleo['pos'], culpado['pos'], (0, 255, 255), 2)
+            poluidor = culpado
+    
+    # 4. Atualiza os dados finais
+    dados['lista_navios'] = objs_navio
+    dados['navios'] = len(objs_navio)
+    dados['oleo'] = len(objs_oleo)
+    dados['poluidor'] = poluidor
+    
+    return img, dados
+
+# ============================================================================
+# 3. FUNÇÕES DO SERVIDOR FLASK
+# ============================================================================
+
+def inicializar_camera():
+    global cap
+    fonte = 0 
+    sistema_os = platform.system()
+    
     if sistema_os == "Linux":
         print("Iniciando modo Raspberry Pi (V4L2)...")
-        # No Linux, somos rigorosos: só roda se abrir o V4L2 corretamente
-        try:
-            cap = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
-            
-            # 1. Verifica se o objeto abriu
-            if not cap.isOpened():
-                print("ERRO CRÍTICO (Raspberry): Câmera não detectada na porta 0.")
-                print("O código será encerrado pois a câmera é obrigatória.")
-                sys.exit() # Encerra o script
-            
-            # 2. Verifica se está recebendo frames reais
-            print("Verificando fluxo de dados da câmera...")
-            ret_teste, _ = cap.read()
-            if not ret_teste:
-                print("ERRO CRÍTICO (Raspberry): Câmera detectada, mas falhou ao enviar imagem (Frame vazio).")
-                print("Verifique o cabo flat ou USB.")
-                sys.exit() # Encerra o script
-                
-            print(">>> SUCESSO: Câmera Raspberry Pi Operacional.")
-            
-        except Exception as e:
-            print(f"ERRO DE EXCEÇÃO: {e}")
-            sys.exit()
-
+        cap = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
     else:
-        # Modo Windows (Mantém a compatibilidade para seus testes no PC)
-        print("Iniciando modo Windows (DirectShow)...")
+        # Modo fallback para teste em PC
+        print("Iniciando modo Windows/Outro (DirectShow)...")
         cap = cv2.VideoCapture(fonte, cv2.CAP_DSHOW)
         if not cap.isOpened():
             cap = cv2.VideoCapture(fonte) # Fallback genérico
-            
-        if not cap.isOpened():
-            print("ERRO: Nenhuma câmera encontrada no Windows.")
-            sys.exit()
 
-    # Configuração de Resolução (Comum aos dois)
+    if not cap.isOpened():
+        print("ERRO CRÍTICO: Não foi possível acessar a câmera.")
+        return False
+    
+    # Configuração de Resolução
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    return True
 
-    # --- INÍCIO DO LOOP ---
-    cv2.namedWindow("CALIBRACAO")
-    cv2.createTrackbar("H Min", "CALIBRACAO", 39, 179, nada)
-    cv2.createTrackbar("S Min", "CALIBRACAO", 0, 255, nada)
-    cv2.createTrackbar("V Min", "CALIBRACAO", 0, 255, nada)
-    cv2.createTrackbar("H Max", "CALIBRACAO", 97, 179, nada)
-    cv2.createTrackbar("S Max", "CALIBRACAO", 132, 255, nada)
-    cv2.createTrackbar("V Max", "CALIBRACAO", 146, 255, nada)
+# --- APP FLASK ---
+app = Flask(__name__)
 
-    print("--- SISTEMA MONITORAMENTO INICIADO ---")
+@app.route('/')
+def index():
+    if not cap or not cap.isOpened():
+        return "<h1>Erro: Câmera não inicializada ou não detectada! Verifique o console do Raspberry Pi.</h1>"
+    
+    db_navios = carregar_banco_dados_navios(ARQUIVO_CSV)
+    
+    # 1. CAPTURA A FOTO
+    ret, frame = cap.read()
+    if not ret:
+        return "<h1>Erro: Falha ao capturar o frame da câmera.</h1>"
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Aviso: Perda de sinal da câmera.")
-            break
+    start_time = time.time()
+    
+    # 2. PREPARAÇÃO DA IMAGEM
+    frame = cv2.resize(frame, (800, 600))
+    arena = frame.copy() # Não há mais recorte, a arena é o frame inteiro
+    
+    # 3. ANÁLISE E IDENTIFICAÇÃO (CHAMADA PRINCIPAL)
+    dados = {'lista_navios': [], 'navios': 0, 'algas': 0, 'oleo': 0, 'poluidor': None}
+    arena_analisada, dados = desenhar_rotulos(arena, dados)
+    
+    end_time = time.time()
+    
+    # 4. EXPORTAÇÃO PARA HTML (Base64)
+    _, buffer = cv2.imencode('.jpg', arena_analisada)
+    img_b64 = base64.b64encode(buffer).decode('utf-8')
+    
+    # 5. MONTA O HTML COM OS DADOS DA CONTAGEM
+    
+    alerta_poluidor = ""
+    if dados['poluidor']:
+        alerta_poluidor = f"""
+            <div style="background-color: darkred; color: white; padding: 10px; border-radius: 5px; margin-top: 15px;">
+                🚨 ALERTA DE POLUIÇÃO! Poluidor MMSI: <strong>{dados['poluidor']['mmsi']}</strong>
+            </div>
+        """
 
-        frame = cv2.resize(frame, (800, 600))
-        
-        calib = {
-            'h_min': cv2.getTrackbarPos("H Min", "CALIBRACAO"), 's_min': cv2.getTrackbarPos("S Min", "CALIBRACAO"),
-            'v_min': cv2.getTrackbarPos("V Min", "CALIBRACAO"), 'h_max': cv2.getTrackbarPos("H Max", "CALIBRACAO"),
-            's_max': cv2.getTrackbarPos("S Max", "CALIBRACAO"), 'v_max': cv2.getTrackbarPos("V Max", "CALIBRACAO")
-        }
+    html_template = f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CubeSat - Análise Remota</title>
+        <meta http-equiv="refresh" content="5"> <style>
+            body {{ font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 20px; background-color: #f0f0f0; }}
+            .container {{ display: flex; max-width: 1200px; width: 100%; gap: 20px; }}
+            .stats {{ flex: 1; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
+            .image-box {{ flex: 2; }}
+            img {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }}
+            h1 {{ color: #007bff; }}
+            .status-item {{ margin-bottom: 10px; font-size: 1.1em; }}
+            .status-item strong {{ display: inline-block; width: 120px; }}
+            .navio {{ color: blue; }}
+            .oleo {{ color: red; font-weight: bold; }}
+            .alga {{ color: green; }}
+        </style>
+    </head>
+    <body>
+        <h1>🛰️ Projeto CubeSat - Monitoramento Remoto</h1>
+        <p>Acessado em: {time.strftime("%H:%M:%S")} | Tempo de Análise: {end_time - start_time:.3f}s</p>
+        <div class="container">
+            <div class="image-box">
+                <img src="data:image/jpeg;base64,{img_b64}" alt="Análise da Imagem">
+            </div>
+            <div class="stats">
+                <h2>📊 Contagem e Status</h2>
+                <div class="status-item navio"><strong>Navios:</strong> {dados['navios']}</div>
+                <div class="status-item oleo"><strong>Manchas de Óleo:</strong> {dados['oleo']}</div>
+                <div class="status-item alga"><strong>Algas:</strong> {dados['algas']}</div>
+                <hr>
+                <p style="font-weight: bold;">Identificação MMSI:</p>
+                <ul>
+                {"".join([f"<li>{n['mmsi']} (Lat: {n['lat']}, Lon: {n['lon']})</li>" for n in dados['lista_navios']][:5])}
+                </ul>
+                {alerta_poluidor}
+            </div>
+        </div>
+        <p>A página atualiza automaticamente a cada 5 segundos.</p>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template)
 
-        # Modo manual (sem corte)
-        arena, ok = recortar_arena(frame, calib)
-        if not ok:
-            cv2.imshow("Projeto CubeSat Monitor", frame)
-            if cv2.waitKey(1) == ord('q'): break
-            continue
+# ============================================================================
+# 4. EXECUÇÃO DO SERVIDOR
+# ============================================================================
 
-        h_arena, w_arena = arena.shape[:2]
-        area_total_km2 = (LARGURA_SIMULACAO * 2) * (ALTURA_SIMULACAO * 2)
-        area_total_px = w_arena * h_arena
-        km2_por_pixel = area_total_km2 / area_total_px if area_total_px > 0 else 0
+if __name__ == '__main__':
+    if not inicializar_camera():
+        print("Não foi possível iniciar o servidor web sem a câmera.")
+        sys.exit()
 
-        hsv_arena = cv2.cvtColor(arena, cv2.COLOR_BGR2HSV)
-        
-        lower_w = np.array([calib['h_min'], calib['s_min'], calib['v_min']])
-        upper_w = np.array([calib['h_max'], calib['s_max'], calib['v_max']])
-        mask_obj = cv2.bitwise_not(cv2.inRange(hsv_arena, lower_w, upper_w))
-
-        kernel_obj = np.ones((3,3), np.uint8)
-        mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_OPEN, kernel_obj, iterations=1)
-        mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_CLOSE, kernel_obj, iterations=2)
-
-        contornos, _ = cv2.findContours(mask_obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        objs_navio = []
-        objs_oleo = []
-        qtd_algas = 0
-
-        for cnt in contornos:
-            area_px = cv2.contourArea(cnt)
-            if area_px < AREA_MINIMA_GERAL: continue
-            if area_px > (w_arena * h_arena) * 0.95: continue
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            centro = (int(x + w/2), int(y + h/2))
-            lat, lon = converter_coord(centro[0], centro[1], w_arena, h_arena)
-
-            mask_i = np.zeros((h_arena, w_arena), dtype=np.uint8)
-            cv2.drawContours(mask_i, [cnt], -1, 255, -1)
-
-            media_hsv = cv2.mean(hsv_arena, mask=mask_i)[:3]
-            media_bgr = cv2.mean(arena, mask=mask_i)[:3]
-
-            label, cor = classificar_objeto(media_hsv, area_px)
-
-            if label == "OLEO":
-                objs_oleo.append({'pos': centro, 'lat': lat, 'lon': lon})
-                cv2.drawContours(arena, [cnt], -1, (0,0,255), 2)
-                
-                area_real_km2 = area_px * km2_por_pixel
-                porcentagem_erro = random.uniform(0.01, 0.10)
-                sinal_erro = random.choice([-1, 1])
-                area_com_erro = area_real_km2 * (1 + (sinal_erro * porcentagem_erro))
-                
-                texto_area = f"{area_com_erro:.2f} km2"
-                cv2.putText(arena, texto_area, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.putText(arena, "OLEO", (x, y + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-            elif label == "ALGA":
-                qtd_algas += 1
-                cv2.circle(arena, centro, 5, cor, -1)
-
-            elif label == "NAVIO":
-                mmsi, conf = identificar_mmsi(media_bgr, db_navios)
-                objs_navio.append({'pos': centro, 'lat': lat, 'lon': lon, 'mmsi': mmsi})
-                cv2.rectangle(arena, (x,y), (x+w, y+h), cor, 2)
-                if w > 10:
-                    cv2.putText(arena, str(mmsi), (x, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-                    cv2.putText(arena, "NAVIO", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, cor, 1)
-
-        poluidor = None
-        for oleo in objs_oleo:
-            menor_d = float('inf')
-            culpado = None
-            for navio in objs_navio:
-                d = math.dist(oleo['pos'], navio['pos'])
-                if d < menor_d:
-                    menor_d = d
-                    culpado = navio
-            if culpado and menor_d < RAIO_POLUIDOR_MAX:
-                cv2.line(arena, oleo['pos'], culpado['pos'], (0, 255, 255), 2)
-                poluidor = culpado
-
-        dados = {
-            'lista_navios': objs_navio,
-            'navios': len(objs_navio),
-            'algas': qtd_algas,
-            'oleo': len(objs_oleo),
-            'poluidor': poluidor
-        }
-
-        frame_final = desenhar_hud(arena, dados)
-        cv2.imshow("Projeto CubeSat Monitor", frame_final)
-
-        if cv2.waitKey(1) == ord('q'): break
-
-    if cap: cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+    # Roda o servidor acessível em qualquer IP da rede (host='0.0.0.0')
+    # Use a porta 80, que é a porta padrão HTTP.
+    print("\n--- SERVIDOR FLASK INICIADO ---")
+    print("Acesse o seu navegador pelo IP do Raspberry Pi, ex: http://192.168.1.100/")
+    app.run(host='0.0.0.0', port=80, debug=False)
