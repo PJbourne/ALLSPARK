@@ -1,341 +1,598 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import cv2
-import numpy as np
-import math
-import csv
-import os
-import random
-import platform
-import sys
 import time
-import base64
-from io import BytesIO
-from flask import Flask, render_template_string, send_file, url_for
+import threading
+import numpy as np
+from flask import Flask, Response, render_template_string, request, jsonify
 
-# ============================================================================
-# CONFIGURAÇÕES E BANCO DE DADOS
-# ============================================================================
-
-ARQUIVO_CSV = "Cores e Figuras.xlsx - Página1.csv"
-LARGURA_SIMULACAO = 200
-ALTURA_SIMULACAO = 200
-MIN_OLEO = np.array([0, 0, 0])
-MAX_OLEO = np.array([180, 255, 60])
-MIN_ALGA = np.array([0, 0, 20])
-MAX_ALGA = np.array([180, 100, 150])
-AREA_MINIMA_GERAL = 10
-AREA_MAXIMA_ALGA = 150
-AREA_MINIMA_OLEO = 151
-RAIO_POLUIDOR_MAX = 150
-
-# Variáveis globais para a câmera
-cap = None
-calib = {} # Calibração padrão
-
-# Calibração Padrão Fixada (HSV da Arena)
-CALIB_PADRAO = {
-    'h_min': 39, 's_min': 0, 'v_min': 0, 
-    'h_max': 97, 's_max': 132, 'v_max': 146
-}
-
-# ============================================================================
-# 1. MÓDULO DE IDENTIFICAÇÃO (MMSI via CSV)
-# ============================================================================
-
-def carregar_banco_dados_navios(caminho_csv):
-    db_navios = []
-    if not os.path.exists(caminho_csv):
-        print(f"AVISO: Arquivo '{caminho_csv}' não encontrado. A identificação MMSI não funcionará.")
-        return []
-    
-    # ... (Resto da função de carregar_banco_dados_navios, que é a mesma)
-    try:
-        with open(caminho_csv, 'r', encoding='utf-8-sig') as f:
-            leitor = csv.reader(f)
-            try:
-                next(leitor)
-            except StopIteration:
-                pass
-            for linha in leitor:
-                if len(linha) >= 6:
-                    mmsi = linha[1]
-                    try:
-                        r = int(float(linha[3]))
-                        g = int(float(linha[4]))
-                        b = int(float(linha[5]))
-                        db_navios.append({'mmsi': mmsi, 'rgb': (r, g, b)})
-                    except ValueError:
-                        continue
-        print(f"Sucesso: {len(db_navios)} navios carregados do banco de dados.")
-        return db_navios
-    except Exception as e:
-        print(f"Erro ao ler CSV: {e}")
-        return []
-
-def identificar_mmsi(cor_bgr_media, db_navios):
-    if not db_navios:
-        return "Desconhecido", 999
-
-    b, g, r = [int(v) for v in cor_bgr_media]
-    menor_distancia = float('inf')
-    mmsi_encontrado = "Desconhecido"
-
-    for navio in db_navios:
-        r_db, g_db, b_db = navio['rgb']
-        dist = math.sqrt((r - r_db)**2 + (g - g_db)**2 + (b - b_db)**2)
-
-        if dist < menor_distancia:
-            menor_distancia = dist
-            mmsi_encontrado = navio['mmsi']
-
-    if menor_distancia > 50:
-        return "Não listado", menor_distancia
-
-    return mmsi_encontrado, menor_distancia
-
-# ============================================================================
-# 2. FUNÇÕES DE PROCESSAMENTO
-# ============================================================================
-
-def converter_coord(x, y, w_img, h_img):
-    lon = np.interp(x, [0, w_img], [-LARGURA_SIMULACAO, LARGURA_SIMULACAO])
-    lat = np.interp(y, [0, h_img], [ALTURA_SIMULACAO, -ALTURA_SIMULACAO])
-    return int(lat), int(lon)
-
-def checar_se_cor_esta_no_intervalo(hsv_pixel, min_arr, max_arr):
-    return (min_arr[0] <= hsv_pixel[0] <= max_arr[0] and
-            min_arr[1] <= hsv_pixel[1] <= max_arr[1] and
-            min_arr[2] <= hsv_pixel[2] <= max_arr[2])
-
-def classificar_objeto(media_hsv, area):
-    if checar_se_cor_esta_no_intervalo(media_hsv, MIN_OLEO, MAX_OLEO) and area >= AREA_MINIMA_OLEO:
-        return "OLEO", (0, 0, 0)
-    elif checar_se_cor_esta_no_intervalo(media_hsv, MIN_ALGA, MAX_ALGA) and area <= AREA_MAXIMA_ALGA:
-        return "ALGA", (180, 180, 180)
-    else:
-        return "NAVIO", (0, 0, 255)
-
-def desenhar_rotulos(img, dados):
-    h_arena, w_arena = img.shape[:2]
-    
-    # Reutiliza a lógica de detecção para desenhar no frame
-    
-    # 1. Contornos e Máscaras (Usando a calibração padrão fixa)
-    hsv_arena = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_w = np.array([CALIB_PADRAO['h_min'], CALIB_PADRAO['s_min'], CALIB_PADRAO['v_min']])
-    upper_w = np.array([CALIB_PADRAO['h_max'], CALIB_PADRAO['s_max'], CALIB_PADRAO['v_max']])
-    mask_obj = cv2.bitwise_not(cv2.inRange(hsv_arena, lower_w, upper_w))
-
-    kernel_obj = np.ones((3,3), np.uint8)
-    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_OPEN, kernel_obj, iterations=1)
-    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_CLOSE, kernel_obj, iterations=2)
-
-    contornos, _ = cv2.findContours(mask_obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # 2. Recálculo e Desenho
-    db_navios = carregar_banco_dados_navios(ARQUIVO_CSV)
-    
-    objs_navio = []
-    objs_oleo = []
-    
-    # Recomputa a área real (km²)
-    area_total_km2 = (LARGURA_SIMULACAO * 2) * (ALTURA_SIMULACAO * 2)
-    area_total_px = w_arena * h_arena
-    km2_por_pixel = area_total_km2 / area_total_px if area_total_px > 0 else 0
-
-
-    for cnt in contornos:
-        area_px = cv2.contourArea(cnt)
-        if area_px < AREA_MINIMA_GERAL: continue
-        if area_px > (w_arena * h_arena) * 0.95: continue
-
-        x, y, w, h = cv2.boundingRect(cnt)
-        centro = (int(x + w/2), int(y + h/2))
-        
-        mask_i = np.zeros((h_arena, w_arena), dtype=np.uint8)
-        cv2.drawContours(mask_i, [cnt], -1, 255, -1)
-
-        media_hsv = cv2.mean(hsv_arena, mask=mask_i)[:3]
-        media_bgr = cv2.mean(img, mask=mask_i)[:3]
-
-        label, cor = classificar_objeto(media_hsv, area_px)
-        
-        lat, lon = converter_coord(centro[0], centro[1], w_arena, h_arena)
-
-        if label == "OLEO":
-            objs_oleo.append({'pos': centro, 'lat': lat, 'lon': lon})
-            cv2.drawContours(img, [cnt], -1, (0,0,255), 2)
-            
-            # Desenha texto da área (mantendo a lógica de erro do código original)
-            area_real_km2 = area_px * km2_por_pixel
-            porcentagem_erro = random.uniform(0.01, 0.10)
-            sinal_erro = random.choice([-1, 1])
-            area_com_erro = area_real_km2 * (1 + (sinal_erro * porcentagem_erro))
-            texto_area = f"{area_com_erro:.2f} km2"
-            cv2.putText(img, texto_area, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            cv2.putText(img, "OLEO", (x, y + h + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        elif label == "ALGA":
-            dados['algas'] += 1
-            cv2.circle(img, centro, 5, cor, -1)
-
-        elif label == "NAVIO":
-            mmsi, conf = identificar_mmsi(media_bgr, db_navios)
-            objs_navio.append({'pos': centro, 'lat': lat, 'lon': lon, 'mmsi': mmsi})
-            cv2.rectangle(img, (x,y), (x+w, y+h), cor, 2)
-            if w > 10:
-                cv2.putText(img, str(mmsi), (x, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-                cv2.putText(img, "NAVIO", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, cor, 1)
-
-    # 3. Lógica do Poluidor
-    poluidor = None
-    for oleo in objs_oleo:
-        menor_d = float('inf')
-        culpado = None
-        for navio in objs_navio:
-            d = math.dist(oleo['pos'], navio['pos'])
-            if d < menor_d:
-                menor_d = d
-                culpado = navio
-        if culpado and menor_d < RAIO_POLUIDOR_MAX:
-            cv2.line(img, oleo['pos'], culpado['pos'], (0, 255, 255), 2)
-            poluidor = culpado
-    
-    # 4. Atualiza os dados finais
-    dados['lista_navios'] = objs_navio
-    dados['navios'] = len(objs_navio)
-    dados['oleo'] = len(objs_oleo)
-    dados['poluidor'] = poluidor
-    
-    return img, dados
-
-# ============================================================================
-# 3. FUNÇÕES DO SERVIDOR FLASK
-# ============================================================================
-
-def inicializar_camera():
-    global cap
-    fonte = 0 
-    sistema_os = platform.system()
-    
-    if sistema_os == "Linux":
-        print("Iniciando modo Raspberry Pi (V4L2)...")
-        cap = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
-    else:
-        # Modo fallback para teste em PC
-        print("Iniciando modo Windows/Outro (DirectShow)...")
-        cap = cv2.VideoCapture(fonte, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(fonte) # Fallback genérico
-
-    if not cap.isOpened():
-        print("ERRO CRÍTICO: Não foi possível acessar a câmera.")
-        return False
-    
-    # Configuração de Resolução
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
-    return True
-
-# --- APP FLASK ---
+# ============================================================================ 
+# 1. VARIÁVEIS GLOBAIS E CONFIGURAÇÕES
+# ============================================================================ 
+frame_raw = None
+frame_output = None
+lock = threading.Lock()
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    if not cap or not cap.isOpened():
-        return "<h1>Erro: Câmera não inicializada ou não detectada! Verifique o console do Raspberry Pi.</h1>"
-    
-    db_navios = carregar_banco_dados_navios(ARQUIVO_CSV)
-    
-    # 1. CAPTURA A FOTO
-    ret, frame = cap.read()
-    if not ret:
-        return "<h1>Erro: Falha ao capturar o frame da câmera.</h1>"
+# --- Estados do Sistema ---
+CURRENT_MODE = 'RAW'   # RAW, DETECT, DEBUG
+FLIP_CAMERA = False
 
-    start_time = time.time()
-    
-    # 2. PREPARAÇÃO DA IMAGEM
-    frame = cv2.resize(frame, (800, 600))
-    arena = frame.copy() # Não há mais recorte, a arena é o frame inteiro
-    
-    # 3. ANÁLISE E IDENTIFICAÇÃO (CHAMADA PRINCIPAL)
-    dados = {'lista_navios': [], 'navios': 0, 'algas': 0, 'oleo': 0, 'poluidor': None}
-    arena_analisada, dados = desenhar_rotulos(arena, dados)
-    
-    end_time = time.time()
-    
-    # 4. EXPORTAÇÃO PARA HTML (Base64)
-    _, buffer = cv2.imencode('.jpg', arena_analisada)
-    img_b64 = base64.b64encode(buffer).decode('utf-8')
-    
-    # 5. MONTA O HTML COM OS DADOS DA CONTAGEM
-    
-    alerta_poluidor = ""
-    if dados['poluidor']:
-        alerta_poluidor = f"""
-            <div style="background-color: darkred; color: white; padding: 10px; border-radius: 5px; margin-top: 15px;">
-                🚨 ALERTA DE POLUIÇÃO! Poluidor MMSI: <strong>{dados['poluidor']['mmsi']}</strong>
-            </div>
-        """
+# --- ROI (Recorte: frações 0.0..1.0) ---
+ROI_TOP = 0.0
+ROI_BOTTOM = 1.0
+ROI_LEFT = 0.0
+ROI_RIGHT = 1.0
 
-    html_template = f"""
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CubeSat - Análise Remota</title>
-        <meta http-equiv="refresh" content="5"> <style>
-            body {{ font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 20px; background-color: #f0f0f0; }}
-            .container {{ display: flex; max-width: 1200px; width: 100%; gap: 20px; }}
-            .stats {{ flex: 1; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
-            .image-box {{ flex: 2; }}
-            img {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }}
-            h1 {{ color: #007bff; }}
-            .status-item {{ margin-bottom: 10px; font-size: 1.1em; }}
-            .status-item strong {{ display: inline-block; width: 120px; }}
-            .navio {{ color: blue; }}
-            .oleo {{ color: red; font-weight: bold; }}
-            .alga {{ color: green; }}
-        </style>
-    </head>
-    <body>
-        <h1>🛰️ Projeto CubeSat - Monitoramento Remoto</h1>
-        <p>Acessado em: {time.strftime("%H:%M:%S")} | Tempo de Análise: {end_time - start_time:.3f}s</p>
-        <div class="container">
-            <div class="image-box">
-                <img src="data:image/jpeg;base64,{img_b64}" alt="Análise da Imagem">
-            </div>
-            <div class="stats">
-                <h2>📊 Contagem e Status</h2>
-                <div class="status-item navio"><strong>Navios:</strong> {dados['navios']}</div>
-                <div class="status-item oleo"><strong>Manchas de Óleo:</strong> {dados['oleo']}</div>
-                <div class="status-item alga"><strong>Algas:</strong> {dados['algas']}</div>
-                <hr>
-                <p style="font-weight: bold;">Identificação MMSI:</p>
-                <ul>
-                {"".join([f"<li>{n['mmsi']} (Lat: {n['lat']}, Lon: {n['lon']})</li>" for n in dados['lista_navios']][:5])}
-                </ul>
-                {alerta_poluidor}
-            </div>
-        </div>
-        <p>A página atualiza automaticamente a cada 5 segundos.</p>
-    </body>
-    </html>
+# --- Parâmetros de Detecção ---
+GAMMA_VALUE = 1.0
+INVERTED_THRESH = 180
+MIN_AREA = 10
+MAX_OIL_AREA = 300
+SHIP_CIRCULARITY_THRESH = 0.82
+SKELETON_SAMPLING = 5
+
+# --- Conversão pixel² -> km² (simulação / escala)
+# 1 pixel² = 250 m² -> 250 / 1_000_000 = 0.00025 km²? careful:
+# 250 m² = 0.00025 km². BUT earlier we used 250 m² -> 250/1e6 = 0.00025 km².
+# Many prior messages used 0.00000025 (which equals 0.25 m²) — to be consistent with prior assistant
+# we will use the value the user approved earlier: 250 m²/pixel² -> 0.00025 km²/pixel²
+# If you want a different scale, change KM2_POR_PIXEL below.
+KM2_POR_PIXEL = 0.00025  # 250 m² per pixel² => 0.00025 km² per pixel² (simulation)
+
+# --- Valores globais de leitura/resultados ---
+OIL_AREA_PX = 0
+OIL_AREA_KM2 = 0.0
+
+# --- Camera config ---
+CAM_INDEX = 0
+CAM_WIDTH = 640
+CAM_HEIGHT = 480
+CAM_FOURCC = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
+
+# ============================================================================ 
+# 2. FUNÇÕES DE PROCESSAMENTO (auxiliares)
+# ============================================================================ 
+def adjust_gamma(image, gamma=1.0):
+    if gamma == 1.0: 
+        return image
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255
+                      for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+def apply_clahe(image):
+    try:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl, a, b))
+        return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    except Exception:
+        return image
+
+def verificar_borda(cnt, width, height, margin=5):
+    x, y, w, h = cv2.boundingRect(cnt)
+    toca_topo = (y <= margin)
+    toca_fundo = (y + h >= height - margin)
+    toca_esq = (x <= margin)
+    toca_dir = (x + w >= width - margin)
+    return (toca_topo or toca_fundo or toca_esq or toca_dir)
+
+def desenhar_pontos_traco(img, cnt):
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.01 * peri, False)
+    try:
+        pontos = approx.reshape(-1, 2)
+    except Exception:
+        return
+    if len(pontos) > SKELETON_SAMPLING:
+        indices = np.linspace(0, len(pontos) - 1, SKELETON_SAMPLING).astype(int)
+        pontos_para_desenhar = pontos[indices]
+    else:
+        pontos_para_desenhar = pontos
+    for point in pontos_para_desenhar:
+        px, py = int(point[0]), int(point[1])
+        cv2.circle(img, (px, py), 3, (0, 255, 255), -1)
+        texto = f"{px},{py}"
+        tx, ty = px + 5, py - 5
+        h, w = img.shape[:2]
+        if tx > w - 50: tx = px - 50
+        if ty < 15: ty = py + 15
+        cv2.putText(img, texto, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
+
+def desenhar_indicador(img, cnt, area, circularity, tipo):
     """
-    return render_template_string(html_template)
+    Desenha indicadores (caixa/retângulo/círculo) e escreve percentual da área relativa (em % do ROI).
+    """
+    h_img, w_img = img.shape[:2]
+    area_total_roi = h_img * w_img
+    pct_area = 0.0
+    if area_total_roi > 0:
+        pct_area = (area / area_total_roi) * 100.0
 
-# ============================================================================
-# 4. EXECUÇÃO DO SERVIDOR
-# ============================================================================
+    color = (0, 0, 255)  # padrão vermelho para óleo
+    cx, cy = 0, 0
+    label_offset_y = 0
 
+    if tipo == "TRACO" or tipo == "GOTA":
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        box = np.int64(box)
+        cv2.drawContours(img, [box], 0, color, 2)
+        cx, cy = int(rect[0][0]), int(rect[0][1])
+        label_offset_y = -20
+        desenhar_pontos_traco(img, cnt)
+    else:
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+        center = (int(x), int(y))
+        radius = int(radius)
+        if tipo == "NAVIO":
+            color = (255, 200, 0)
+        cv2.circle(img, center, radius + 5, color, 2)
+        cx, cy = int(x), int(y)
+        label_offset_y = -(radius + 10)
+
+    label_x = cx + 30
+    label_y = cy + label_offset_y
+    h_img, w_img = img.shape[:2]
+    label_x = min(label_x, w_img - 220)
+    label_y = max(label_y, 30)
+    label_y = min(label_y, h_img - 10)
+
+    cv2.line(img, (cx, cy), (label_x - 5, label_y + 5), color, 1)
+    text = f"{tipo} {pct_area:.2f}% (px:{int(area)})"
+    cv2.putText(img, text, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+# ============================================================================ 
+# 3. PROCESSAMENTO PRINCIPAL DO FRAME (aqui integramos o cálculo da área em km²)
+# ============================================================================ 
+def processar_frame(frame, mode='DETECT'):
+    """
+    Recebe um frame BGR e retorna uma imagem anotada (BGR).
+    Atualiza OIL_AREA_PX e OIL_AREA_KM2 quando uma mancha é detectada.
+    """
+    global MIN_AREA, INVERTED_THRESH, MAX_OIL_AREA, SHIP_CIRCULARITY_THRESH
+    global OIL_AREA_PX, OIL_AREA_KM2
+
+    if frame is None:
+        return None
+
+    # 1. RECORTE (ROI)
+    height, width = frame.shape[:2]
+    y1 = int(height * max(0.0, min(ROI_TOP, ROI_BOTTOM)))
+    y2 = int(height * max(0.0, min(ROI_BOTTOM, 1.0)))
+    x1 = int(width * max(0.0, min(ROI_LEFT, ROI_RIGHT)))
+    x2 = int(width * max(0.0, min(ROI_RIGHT, 1.0)))
+    if (y2 - y1) < 10 or (x2 - x1) < 10:
+        roi = frame.copy()
+    else:
+        roi = frame[y1:y2, x1:x2]
+
+    h_roi, w_roi = roi.shape[:2]
+
+    # 2. Pré-processamento
+    roi_proc = apply_clahe(roi)
+    roi_proc = adjust_gamma(roi_proc, GAMMA_VALUE)
+
+    # 3. Binarização (sua pipeline original)
+    gray = cv2.cvtColor(roi_proc, cv2.COLOR_BGR2GRAY)
+    inverted = cv2.bitwise_not(gray)
+    _, binary = cv2.threshold(inverted, INVERTED_THRESH, 255, cv2.THRESH_BINARY)
+
+    # 4. Morfologia
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    binary = cv2.dilate(binary, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    if mode == 'DEBUG':
+        debug_view = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(debug_view, (0,0), (w_roi, h_roi), (0,0,255), 10)
+        return debug_view
+
+    # 5. Análise de contornos
+    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    output_view = roi.copy()
+    oleo_detectado = False
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < MIN_AREA:
+            continue
+
+        # Ignora objetos tocando a borda do ROI
+        if verificar_borda(cnt, w_roi, h_roi, margin=4):
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * np.pi * (area / (perimeter * perimeter))
+
+        # Classificação e desenho
+        if circularity >= 0.65:
+            # NAVIO
+            if area > MAX_OIL_AREA and circularity >= SHIP_CIRCULARITY_THRESH:
+                desenhar_indicador(output_view, cnt, area, circularity, "NAVIO")
+            else:
+                # GOTA (provável mancha redonda)
+                if not oleo_detectado:
+                    desenhar_indicador(output_view, cnt, area, circularity, "GOTA")
+                    with lock:
+                        OIL_AREA_PX = float(area)
+                        OIL_AREA_KM2 = OIL_AREA_PX * KM2_POR_PIXEL
+                    oleo_detectado = True
+                else:
+                    cv2.drawContours(output_view, [cnt], -1, (0,0,255), 1)
+        else:
+            # TRACO (mancha alongada/irregular)
+            if not oleo_detectado:
+                desenhar_indicador(output_view, cnt, area, circularity, "TRACO")
+                with lock:
+                    OIL_AREA_PX = float(area)
+                    OIL_AREA_KM2 = OIL_AREA_PX * KM2_POR_PIXEL
+                oleo_detectado = True
+            else:
+                cv2.drawContours(output_view, [cnt], -1, (0,0,255), 1)
+
+    # Se nada detectado, zera as variáveis (opcional)
+    if not oleo_detectado:
+        with lock:
+            OIL_AREA_PX = 0.0
+            OIL_AREA_KM2 = 0.0
+
+    return output_view
+
+# ============================================================================ 
+# 4. DETECÇÃO GEOMÉTRICA (AUTO CROP) - igual ao seu original
+# ============================================================================ 
+def detectar_canvas_geometrico(img):
+    global ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT
+    h_img, w_img = img.shape[:2]
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edged = cv2.Canny(blurred, 30, 100)
+    kernel = np.ones((5,5), np.uint8)
+    edged = cv2.dilate(edged, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    found_rect = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            area = cv2.contourArea(c)
+            if area > (w_img * h_img * 0.1):
+                found_rect = approx
+                break
+
+    if found_rect is not None:
+        x, y, w, h = cv2.boundingRect(found_rect)
+        margin_x = int(w * 0.05)
+        margin_y = int(h * 0.05)
+        x_new = x + margin_x
+        y_new = y + margin_y
+        w_new = w - (2 * margin_x)
+        h_new = h - (2 * margin_y)
+
+        ROI_LEFT = max(0.0, x_new / w_img)
+        ROI_TOP = max(0.0, y_new / h_img)
+        ROI_RIGHT = min(1.0, (x_new + w_new) / w_img)
+        ROI_BOTTOM = min(1.0, (y_new + h_new) / h_img)
+        return True
+    return False
+
+# ============================================================================ 
+# 5. CÂMERA E SERVIDOR (camera loop e gerador de frames)
+# ============================================================================ 
+def camera_loop():
+    global frame_raw, frame_output, CURRENT_MODE, FLIP_CAMERA
+    backend = cv2.CAP_V4L2
+    cap = cv2.VideoCapture(CAM_INDEX, backend)
+    if not cap.isOpened():
+        # fallback sem backend específico
+        cap = cv2.VideoCapture(CAM_INDEX)
+    # tenta configurar
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, CAM_FOURCC)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    except Exception:
+        pass
+
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            with lock:
+                frame_raw = frame.copy()
+            if FLIP_CAMERA:
+                frame_proc = cv2.flip(frame, -1)
+            else:
+                frame_proc = frame.copy()
+
+            if CURRENT_MODE == 'RAW':
+                out = frame_proc
+            elif CURRENT_MODE == 'DETECT':
+                out = processar_frame(frame_proc, mode='DETECT')
+            elif CURRENT_MODE == 'DEBUG':
+                out = processar_frame(frame_proc, mode='DEBUG')
+            else:
+                out = frame_proc
+
+            with lock:
+                frame_output = out
+        else:
+            time.sleep(0.5)
+            # tenta reabrir se falhar
+            try:
+                cap.release()
+                cap = cv2.VideoCapture(CAM_INDEX, backend)
+            except Exception:
+                pass
+        time.sleep(0.01)
+
+def gerar_frames():
+    global frame_output
+    while True:
+        with lock:
+            if frame_output is None:
+                img = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
+                cv2.putText(img, "AGUARDANDO CAMERA...", (50, int(CAM_HEIGHT/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                out = img
+            else:
+                out = frame_output.copy()
+            flag, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            if not flag:
+                continue
+            frame = encoded.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.04)
+
+# ============================================================================ 
+# 6. FLASK ROUTES (UI + APIs)
+# ============================================================================ 
+HTML_INDEX = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sistema de Visão Ultimate (Auto)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; text-align: center; margin: 0; padding-bottom: 50px;}
+        .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; margin-top: 20px; }
+        .video-container { border: 2px solid #444; display: inline-block; position: relative; }
+        .panel { background: #1e1e1e; padding: 20px; border-radius: 8px; width: 320px; text-align: left; border: 1px solid #333; }
+        .btn { width: 100%; padding: 10px; margin: 5px 0; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; color: white; }
+        .btn-blue { background-color: #007bff; }
+        .btn-red { background-color: #dc3545; }
+        .btn-gray { background-color: #6c757d; }
+        .slider-group { margin-bottom: 12px; }
+        label { display: flex; justify-content: space-between; font-size: 13px; color: #ccc; }
+        input[type=range] { width: 100%; margin-top: 5px; }
+        h4 { margin-top: 15px; margin-bottom: 10px; color: #fff; border-bottom: 1px solid #444; padding-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="video-container">
+            <img src="/video_stream" width="640" height="480">
+            <div style="position:absolute; top:5px; left:5px; color: yellow; text-shadow: 1px 1px 2px black; font-weight:bold;" id="mode_display">AO VIVO</div>
+        </div>
+        
+        <div class="panel">
+            <button class="btn btn-blue" onclick="triggerAuto()">🪄 RECORTE AUTOMÁTICO (Geométrico)</button>
+            <button class="btn btn-red" onclick="resetView()">❌ RESETAR TUDO</button>
+            <button class="btn btn-gray" onclick="setMode('DEBUG')">👁️ MODO DEBUG (Ver Binarização)</button>
+
+            <h4>✂️ Recorte Manual (Ignora Borda)</h4>
+            <div class="slider-group">
+                <label>Topo (Y1): <span id="lbl_top">0%</span></label>
+                <input type="range" id="roi_top" min="0" max="50" value="0" oninput="updateROI()">
+            </div>
+            <div class="slider-group">
+                <label>Baixo (Y2): <span id="lbl_bottom">100%</span></label>
+                <input type="range" id="roi_bottom" min="50" max="100" value="100" oninput="updateROI()">
+            </div>
+            <div class="slider-group">
+                <label>Esquerda (X1): <span id="lbl_left">0%</span></label>
+                <input type="range" id="roi_left" min="0" max="50" value="0" oninput="updateROI()">
+            </div>
+            <div class="slider-group">
+                <label>Direita (X2): <span id="lbl_right">100%</span></label>
+                <input type="range" id="roi_right" min="50" max="100" value="100" oninput="updateROI()">
+            </div>
+
+            <h4>🎛️ Ajustes de Detecção</h4>
+            <div class="slider-group">
+                <label>Limiar Preto: <span id="val_thresh">180</span></label>
+                <input type="range" id="inverted_thresh" min="100" max="254" value="180" oninput="updateParams()">
+            </div>
+            <div class="slider-group">
+                <label>Área Min (Navio): <span id="val_area">300</span></label>
+                <input type="range" id="max_oil_area" min="50" max="1000" value="300" oninput="updateParams()">
+            </div>
+
+            <h4>📊 Status</h4>
+            <div>Área da maior mancha: <b id="oil_area">0.000000</b> km²</div>
+            <div style="margin-top:8px; font-size:12px; color:#aaa;">(Atualiza a cada 1s)</div>
+
+        </div>
+    </div>
+
+    <script>
+        window.onload = function() {
+            let countdown = 5;
+            const display = document.getElementById('mode_display');
+            const timer = setInterval(() => {
+                display.innerText = "AUTO-START: " + countdown + "s";
+                countdown--;
+                if (countdown < 0) {
+                    clearInterval(timer);
+                    triggerAuto();
+                }
+            }, 1000);
+
+            // atualiza area a cada segundo
+            setInterval(() => {
+                fetch('/oil_area').then(r=>r.json()).then(j=>{
+                    document.getElementById('oil_area').innerText = Number(j.area_km2).toFixed(6);
+                }).catch(()=>{});
+            }, 1000);
+        };
+
+        function setMode(m) { fetch('/set_mode/'+m); document.getElementById('mode_display').innerText = m; }
+        
+        function triggerAuto() { 
+            document.getElementById('mode_display').innerText = "BUSCANDO...";
+            fetch('/trigger_auto_crop').then(r=>r.text()).then(msg => { 
+                if(msg.includes("Falha")) {
+                     document.getElementById('mode_display').innerText = "FALHA AUTO (USE MANUAL)";
+                } else {
+                     alert(msg); 
+                }
+                updateLabels(); 
+            });
+        }
+        
+        function resetView() { 
+            fetch('/reset_view').then(() => {
+                document.getElementById('roi_top').value = 0;
+                document.getElementById('roi_bottom').value = 100;
+                document.getElementById('roi_left').value = 0;
+                document.getElementById('roi_right').value = 100;
+                updateLabels();
+                document.getElementById('mode_display').innerText = "AO VIVO";
+            });
+        }
+        
+        function updateROI() {
+            const top = document.getElementById('roi_top').value;
+            const bottom = document.getElementById('roi_bottom').value;
+            const left = document.getElementById('roi_left').value;
+            const right = document.getElementById('roi_right').value;
+            
+            document.getElementById('lbl_top').innerText = top + "%";
+            document.getElementById('lbl_bottom').innerText = bottom + "%";
+            document.getElementById('lbl_left').innerText = left + "%";
+            document.getElementById('lbl_right').innerText = right + "%";
+
+            fetch('/update_roi', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({top: top, bottom: bottom, left: left, right: right})
+            });
+        }
+
+        function updateParams() {
+            const params = {
+                gamma: 1.0,
+                inverted_thresh: document.getElementById('inverted_thresh').value,
+                max_oil_area: document.getElementById('max_oil_area').value,
+                ship_circ: 0.82
+            };
+            document.getElementById('val_thresh').innerText = params.inverted_thresh;
+            document.getElementById('val_area').innerText = params.max_oil_area;
+            fetch('/update_params', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(params) });
+        }
+        function updateLabels() {
+             document.getElementById('lbl_top').innerText = document.getElementById('roi_top').value + "%";
+             document.getElementById('lbl_bottom').innerText = document.getElementById('roi_bottom').value + "%";
+             document.getElementById('lbl_left').innerText = document.getElementById('roi_left').value + "%";
+             document.getElementById('lbl_right').innerText = document.getElementById('roi_right').value + "%";
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_INDEX)
+
+@app.route("/video_stream")
+def video_stream():
+    return Response(gerar_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/set_mode/<mode>")
+def set_mode(mode):
+    global CURRENT_MODE
+    if mode in ['RAW', 'DETECT', 'DEBUG']:
+        with lock:
+            CURRENT_MODE = mode
+    return "OK"
+
+@app.route("/trigger_auto_crop")
+def trigger_auto_crop():
+    global FLIP_CAMERA, CURRENT_MODE
+    with lock:
+        if frame_raw is not None:
+            # teste com frame raw (não flipado)
+            frame_test = frame_raw.copy()
+            sucesso = detectar_canvas_geometrico(frame_test)
+            if sucesso:
+                FLIP_CAMERA = True
+                CURRENT_MODE = 'DETECT'
+                return "Sucesso! Canvas Detectado."
+            else:
+                return "Falha no Auto-Crop. Use sliders manuais."
+    return "Erro camera"
+
+@app.route("/update_roi", methods=['POST'])
+def update_roi():
+    global ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT, FLIP_CAMERA, CURRENT_MODE
+    data = request.json
+    with lock:
+        ROI_TOP = float(data['top']) / 100.0
+        ROI_BOTTOM = float(data['bottom']) / 100.0
+        ROI_LEFT = float(data['left']) / 100.0
+        ROI_RIGHT = float(data['right']) / 100.0
+        FLIP_CAMERA = True
+        CURRENT_MODE = 'DETECT'
+    return "ROI Updated"
+
+@app.route("/update_params", methods=['POST'])
+def update_params():
+    global GAMMA_VALUE, INVERTED_THRESH, MAX_OIL_AREA, SHIP_CIRCULARITY_THRESH
+    data = request.json
+    GAMMA_VALUE = float(data.get('gamma', GAMMA_VALUE))
+    INVERTED_THRESH = int(data.get('inverted_thresh', INVERTED_THRESH))
+    MAX_OIL_AREA = int(data.get('max_oil_area', MAX_OIL_AREA))
+    SHIP_CIRCULARITY_THRESH = float(data.get('ship_circ', SHIP_CIRCULARITY_THRESH))
+    return "OK"
+
+@app.route("/reset_view")
+def reset_view():
+    global ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT, CURRENT_MODE, FLIP_CAMERA
+    with lock:
+        ROI_TOP, ROI_LEFT, ROI_BOTTOM, ROI_RIGHT = 0.0, 0.0, 1.0, 1.0
+        CURRENT_MODE = 'RAW'
+        FLIP_CAMERA = False
+    return "Reset OK"
+
+@app.route("/oil_area")
+def oil_area():
+    """
+    Retorna a maior mancha detectada (em px e km2) como JSON.
+    """
+    with lock:
+        return jsonify({
+            "area_px": float(OIL_AREA_PX),
+            "area_km2": float(OIL_AREA_KM2)
+        })
+
+# ============================================================================ 
+# 7. INICIALIZAÇÃO (thread da câmera e servidor)
+# ============================================================================ 
 if __name__ == '__main__':
-    if not inicializar_camera():
-        print("Não foi possível iniciar o servidor web sem a câmera.")
-        sys.exit()
-
-    # Roda o servidor acessível em qualquer IP da rede (host='0.0.0.0')
-    # Use a porta 80, que é a porta padrão HTTP.
-    print("\n--- SERVIDOR FLASK INICIADO ---")
-    print("Acesse o seu navegador pelo IP do Raspberry Pi, ex: http://192.168.1.100/")
-    app.run(host='0.0.0.0', port=80, debug=False)
+    t = threading.Thread(target=camera_loop, daemon=True)
+    t.start()
+    # roda na porta 5000 (como seu exemplo original)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
